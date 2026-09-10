@@ -28,6 +28,8 @@ _worker_operators: dict[int, tuple[Callable, Callable]] | None = None
 _worker_args: dict | None = None
 _worker_custom_mutation_operator: Callable | None = None
 
+ParentGenomePair = tuple[tuple[int, list | dict], tuple[int, list | dict]]
+
 
 def _initialize_parallel_worker(
         fitness_function: Callable,
@@ -249,7 +251,7 @@ class Member(Chromosome):
         parent_ids (list): It's a list with IDs of the parents (from previous generations in the GA) of this member
     """
     id: int
-    parent_ids: list = []
+    parent_ids: list[int]
 
     def __init__(self, genome: list | dict, identification_number: int, fitness_function: Callable | None = None):
         """Apart from what 'Chromosome' class constructor needs, here identification number should be passed.
@@ -264,18 +266,19 @@ class Member(Chromosome):
         """
         super().__init__(genome=genome, fitness_function=fitness_function)
         self.id = identification_number
+        self.parent_ids = []
 
-    def add_parent_ids(self, parent_ids: list):
+    def add_parent_ids(self, parent_ids: list[int]):
         """This method is meant for 'genealogical tree' tracking; it assigns to the current member IDs of its parents.
 
         Parameters:
-            parents_ids (list): A list with IDs of members which are parents to this member, inside the GA.
+            parent_ids (list[int]): IDs of members which are parents to this member, inside the GA.
         """
-        self.parent_ids = parent_ids
+        self.parent_ids = list(parent_ids)
 
     def __repr__(self) -> str:
         """Default method for self-representing objects of this class."""
-        return f"{type(self).__name__}(genes={self.genome}, id={self.id}, parents_id={self.parents_id})"
+        return f"{type(self).__name__}(genes={self.genome}, id={self.id}, parent_ids={self.parent_ids})"
 
 
 class Generation:  # TODO: add diversity measures
@@ -593,8 +596,8 @@ class GeneticAlgorithm:
             parent_generation: Generation,
             operators: dict[int, tuple[Callable, Callable]],
             args: dict
-    ) -> list[tuple[list | dict, list | dict]]:
-        """Select parents once and normalize supported selection results to raw-genome pairs."""
+    ) -> list[ParentGenomePair]:
+        """Select parents once and normalize results to ID-and-genome pairs."""
         selection, _ = operators[combination_id]
         selection_args = args.get("selection") if isinstance(args, dict) and "selection" in args else args
 
@@ -611,12 +614,18 @@ class GeneticAlgorithm:
 
         if selected_parents and isinstance(selected_parents[0], dict):
             parent_pairs = [
-                (parents["parent1"].genome, parents["parent2"].genome)
+                (
+                    (parents["parent1"].id, parents["parent1"].genome),
+                    (parents["parent2"].id, parents["parent2"].genome),
+                )
                 for parents in selected_parents
             ]
         else:
             parent_pairs = [
-                (selected_parents[2 * index].genome, selected_parents[2 * index + 1].genome)
+                (
+                    (selected_parents[2 * index].id, selected_parents[2 * index].genome),
+                    (selected_parents[2 * index + 1].id, selected_parents[2 * index + 1].genome),
+                )
                 for index in range(parent_generation.num_parents_pairs)
             ]
 
@@ -629,7 +638,7 @@ class GeneticAlgorithm:
 
     @staticmethod
     def _build_members_from_parent_pairs(
-            parent_pairs: list[tuple[list | dict, list | dict]],
+            parent_pairs: list[ParentGenomePair],
             crossover: Callable,
             crossover_args,
             fitness_function: Callable,
@@ -638,15 +647,16 @@ class GeneticAlgorithm:
     ) -> list[Member]:
         """Cross parent genomes and assign stable IDs independent of worker completion order."""
         new_members = []
-        for local_pair_index, (parent1_genome, parent2_genome) in enumerate(parent_pairs):
+        for local_pair_index, parent_pair in enumerate(parent_pairs):
+            (parent1_id, parent1_genome), (parent2_id, parent2_genome) = parent_pair
             pair_index = first_pair_index + local_pair_index
             child1_genome, child2_genome = crossover(parent1_genome, parent2_genome, crossover_args)
             child1_id = first_identification_number + 2 * pair_index
-            new_members.extend([
-                Member(child1_genome, child1_id, fitness_function),
-                Member(child2_genome, child1_id + 1, fitness_function),
-            ])
-            # TODO: Record both selected parent IDs on each child for genealogy tracking.
+            child1 = Member(child1_genome, child1_id, fitness_function)
+            child2 = Member(child2_genome, child1_id + 1, fitness_function)
+            child1.add_parent_ids([parent1_id, parent2_id])
+            child2.add_parent_ids([parent1_id, parent2_id])
+            new_members.extend([child1, child2])
         return new_members
 
     def _create_initial_generation(self):
@@ -703,7 +713,7 @@ class GeneticAlgorithm:
     def _create_member_batch(
             combination_id: int,
             first_pair_index: int,
-            parent_pairs: list[tuple[list | dict, list | dict]],
+            parent_pairs: list[ParentGenomePair],
             first_identification_number: int
     ) -> tuple[int, int, list[Member]]:
         """Create one parent-pair batch in a configured pool worker."""

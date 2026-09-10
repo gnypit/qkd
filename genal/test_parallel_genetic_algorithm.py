@@ -287,12 +287,22 @@ class ParallelGeneticAlgorithmTests(unittest.TestCase):
         self.assertEqual([member.genome for member in ga.current_generation.members], [[-1, 1], [1, 1]] * 2)
 
     def test_parent_pair_creation_preserves_member_order_and_ids(self):
-        ga = self.create_ga(creation_parallelism="parent_pairs")
+        ga = self.create_ga(creation_parallelism="parent_pairs", snapshot_interval=1)
         ga.run()
 
+        initial_members = ga.generation_snapshots[0].members
         member_ids = [member.id for member in ga.current_generation.members]
         self.assertEqual(member_ids, list(range(member_ids[0], member_ids[0] + 4)))
         self.assertEqual([member.genome for member in ga.current_generation.members], [[-1, 1], [1, 1]] * 2)
+        self.assertEqual(
+            [member.parent_ids for member in ga.current_generation.members],
+            [
+                [initial_members[0].id, initial_members[1].id],
+                [initial_members[0].id, initial_members[1].id],
+                [initial_members[2].id, initial_members[3].id],
+                [initial_members[2].id, initial_members[3].id],
+            ],
+        )
 
 
 if __name__ == "__main__":
