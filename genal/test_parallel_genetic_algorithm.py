@@ -61,6 +61,7 @@ class ParallelGeneticAlgorithmTests(unittest.TestCase):
             mutation_prob=0.0,
             number_of_generations=1,
             snapshot_interval=None,
+            lineage_tracking="none",
     ):
         return genetic_algorithm.GeneticAlgorithm(
             initial_pop_size=4,
@@ -75,6 +76,7 @@ class ParallelGeneticAlgorithmTests(unittest.TestCase):
             creation_parallelism=creation_parallelism,
             mutation_prob=mutation_prob,
             snapshot_interval=snapshot_interval,
+            lineage_tracking=lineage_tracking,
         )
 
     def test_non_positive_parallel_worker_count_is_rejected(self):
@@ -178,6 +180,44 @@ class ParallelGeneticAlgorithmTests(unittest.TestCase):
         for value in (0, -1):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.create_ga(snapshot_interval=value)
+
+    def test_invalid_lineage_tracking_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.create_ga(lineage_tracking="generations")
+
+    def test_lineage_tracking_is_disabled_by_default(self):
+        ga = self.create_ga()
+        ga.run()
+
+        self.assertIsNone(ga.lineage_tracker)
+        with self.assertRaises(RuntimeError):
+            ga.best_solution_lineage()
+
+    def test_parent_lineage_reconstructs_best_solution_ancestry(self):
+        ga = self.create_ga(number_of_generations=2, lineage_tracking="parents")
+        ga.run()
+
+        self.assertEqual(ga.lineage_tracker.size, 12)
+        lineage = ga.best_solution_lineage()
+        lineage_ids = {record["member_id"] for record in lineage}
+        self.assertNotIn("genome", lineage[-1])
+        self.assertTrue(lineage[-1]["parent_ids"])
+        self.assertTrue(set(lineage[-1]["parent_ids"]).issubset(lineage_ids))
+        self.assertEqual(lineage[-1]["generation"], 2)
+
+    def test_full_lineage_includes_independent_genome_copies(self):
+        ga = self.create_ga(lineage_tracking="full")
+        ga.run()
+
+        lineage = ga.best_solution_lineage()
+        best_record = lineage[-1]
+        stored_genome = best_record["genome"]
+        self.assertEqual(stored_genome.tolist(), ga.best_solution()[0])
+        stored_genome[0] = 999
+        self.assertNotEqual(
+            ga.lineage_tracker.get_genome(best_record["member_id"])[0],
+            999,
+        )
 
     def test_default_retains_fitness_history_without_population_snapshots(self):
         ga = self.create_ga(number_of_generations=3)

@@ -4,6 +4,7 @@ Script is distributed under the license: https://github.com/gnypit/pyqkd/blob/ma
 from __future__ import annotations
 
 import random
+import pickle
 from abc import ABC, abstractmethod
 from collections.abc import \
     Callable  # https://stackoverflow.com/questions/37835179/how-can-i-specify-the-function-type-in-my-type-hints
@@ -359,6 +360,118 @@ class Generation:  # TODO: add diversity measures
         self.fitness_ranking.sort(key=sort_dict_by_fit, reverse=reverse)
 
 
+class LineageTracker:
+    """Compact, append-only genealogy for members of accepted generations."""
+
+    def __init__(self, mode: Literal["parents", "full"], initial_capacity: int = 1024):
+        self.mode = mode
+        self.size = 0
+        self.capacity = max(1, initial_capacity)
+        self.member_ids = np.empty(self.capacity, dtype=np.int64)
+        self.parent_ids = np.full((self.capacity, 2), -1, dtype=np.int64)
+        self.generations = np.empty(self.capacity, dtype=np.int32)
+        self.fitness_values = np.empty(self.capacity, dtype=np.float64)
+        self.id_to_row: dict[int, int] = {}
+        self.genomes: np.ndarray | None = None
+        self.serialized_genomes: list[bytes | None] | None = None
+
+    def _ensure_capacity(self, required_size: int) -> None:
+        if required_size <= self.capacity:
+            return
+        new_capacity = max(required_size, self.capacity * 2)
+
+        def grow(array: np.ndarray, shape: tuple[int, ...], fill_value=None) -> np.ndarray:
+            grown = np.empty(shape, dtype=array.dtype)
+            if fill_value is not None:
+                grown.fill(fill_value)
+            grown[:self.size] = array[:self.size]
+            return grown
+
+        self.member_ids = grow(self.member_ids, (new_capacity,))
+        self.parent_ids = grow(self.parent_ids, (new_capacity, 2), -1)
+        self.generations = grow(self.generations, (new_capacity,))
+        self.fitness_values = grow(self.fitness_values, (new_capacity,))
+        if self.genomes is not None:
+            self.genomes = grow(self.genomes, (new_capacity, *self.genomes.shape[1:]))
+        if self.serialized_genomes is not None:
+            self.serialized_genomes.extend([None] * (new_capacity - self.capacity))
+        self.capacity = new_capacity
+
+    def _initialize_genome_storage(self, generation: Generation) -> None:
+        genomes = [member.genome for member in generation.members]
+        dense_genomes = np.asarray(genomes)
+        if dense_genomes.dtype != object and dense_genomes.ndim >= 2:
+            self.genomes = np.empty((self.capacity, *dense_genomes.shape[1:]), dtype=dense_genomes.dtype)
+        else:
+            self.serialized_genomes = [None] * self.capacity
+
+    def record_generation(self, generation: Generation, generation_number: int) -> None:
+        """Append one accepted generation without retaining its Python object graph."""
+        required_size = self.size + generation.size
+        self._ensure_capacity(required_size)
+        if self.mode == "full" and self.genomes is None and self.serialized_genomes is None:
+            self._initialize_genome_storage(generation)
+
+        for member in generation.members:
+            if member.id in self.id_to_row:
+                raise ValueError(f"Member ID {member.id} has already been recorded in the lineage.")
+            row = self.size
+            self.id_to_row[member.id] = row
+            self.member_ids[row] = member.id
+            self.parent_ids[row] = member.parent_ids if member.parent_ids else (-1, -1)
+            self.generations[row] = generation_number
+            self.fitness_values[row] = member.fit_val
+            if self.mode == "full":
+                if self.genomes is not None:
+                    try:
+                        self.genomes[row] = member.genome
+                    except (TypeError, ValueError) as error:
+                        raise ValueError(
+                            "Full lineage requires consistent numeric genome shapes and dtypes within a run."
+                        ) from error
+                else:
+                    self.serialized_genomes[row] = pickle.dumps(member.genome, protocol=pickle.HIGHEST_PROTOCOL)
+            self.size += 1
+
+    def get_record(self, member_id: int) -> dict:
+        """Return lineage metadata for one recorded member."""
+        row = self.id_to_row[member_id]
+        return {
+            "member_id": int(self.member_ids[row]),
+            "parent_ids": [int(parent_id) for parent_id in self.parent_ids[row] if parent_id >= 0],
+            "generation": int(self.generations[row]),
+            "fitness": float(self.fitness_values[row]),
+        }
+
+    def get_genome(self, member_id: int):
+        """Return an independent ancestral genome copy in full-tracking mode."""
+        if self.mode != "full":
+            raise RuntimeError("Genomes are available only when lineage_tracking='full'.")
+        row = self.id_to_row[member_id]
+        if self.genomes is not None:
+            return self.genomes[row].copy()
+        return pickle.loads(self.serialized_genomes[row])
+
+    def ancestors(self, member_id: int, include_member: bool = True) -> set[int]:
+        """Return all recorded ancestors reachable from a member's two parent links."""
+        if member_id not in self.id_to_row:
+            raise KeyError(member_id)
+        discovered = set()
+        pending = [member_id]
+        while pending:
+            current_id = pending.pop()
+            if current_id in discovered:
+                continue
+            discovered.add(current_id)
+            row = self.id_to_row.get(current_id)
+            if row is None:
+                continue
+            pending.extend(int(parent_id) for parent_id in self.parent_ids[row] if parent_id >= 0)
+        if not include_member:
+            discovered.discard(member_id)
+        return discovered
+
+
 class GeneticAlgorithm:
     """Container for a process-pool-based hierarchical parallel genetic algorithm.
 
@@ -392,6 +505,7 @@ class GeneticAlgorithm:
         best_fit_history (list[float]): Best fitness for the initial population and every accepted generation.
         generation_snapshots (dict[int, Generation]): Optional retained populations keyed by generation number. Empty
             when snapshot retention is disabled; the active/final population is always available as current_generation.
+        lineage_tracker (LineageTracker | None): Compact accepted-member genealogy when lineage tracking is enabled.
         args (dict): dictionary with argument required by the genome generator and all the selection and crossover
             operators to work.
 
@@ -422,6 +536,8 @@ class GeneticAlgorithm:
     best_fit_history: list[float]
     generation_snapshots: dict[int, Generation]
     snapshot_interval: int | None
+    lineage_tracking: Literal["none", "parents", "full"]
+    lineage_tracker: LineageTracker | None
     parallel_workers: int | None
     creation_parallelism: Literal["auto", "local", "operators", "parent_pairs"]
     args: dict
@@ -459,7 +575,8 @@ class GeneticAlgorithm:
                  seed=None, parallel_workers: int | None = None,
                  creation_parallelism: Literal["auto", "local", "operators", "parent_pairs"] = "auto",
                  custom_mutation_operator: Callable | None = None,
-                 snapshot_interval: int | None = None):
+                 snapshot_interval: int | None = None,
+                 lineage_tracking: Literal["none", "parents", "full"] = "none"):
         """GeneticAlgorithm class constructor.
 
         Parameters:
@@ -492,10 +609,12 @@ class GeneticAlgorithm:
             snapshot_interval (int | None): optional positive interval for retaining complete population snapshots.
                 ``None`` retains no historical generations. ``1`` retains every generation; ``N`` retains generation
                 zero and every Nth accepted generation. The current/final generation is always available separately.
+            lineage_tracking (str): ``"none"`` disables genealogy storage; ``"parents"`` stores compact IDs, parent
+                links, generation numbers, and fitness; ``"full"`` additionally stores ancestral genomes.
 
         Raises:
             TypeError: if a worker count or snapshot interval has an invalid type.
-            ValueError: if a worker count or snapshot interval is non-positive, or the creation strategy is unsupported.
+            ValueError: if a numeric option is non-positive or a strategy/mode is unsupported.
         """
         self.pop_size = initial_pop_size
         self.no_generations = number_of_generations
@@ -514,6 +633,11 @@ class GeneticAlgorithm:
                 raise ValueError("snapshot_interval must be greater than zero.")
         self.snapshot_interval = snapshot_interval
         self.generation_snapshots = {}
+        valid_lineage_modes = {"none", "parents", "full"}
+        if lineage_tracking not in valid_lineage_modes:
+            raise ValueError(f"lineage_tracking must be one of {sorted(valid_lineage_modes)}; got {lineage_tracking!r}.")
+        self.lineage_tracking = lineage_tracking
+        self.lineage_tracker = None if lineage_tracking == "none" else LineageTracker(lineage_tracking)
         if parallel_workers is not None:
             if isinstance(parallel_workers, bool) or not isinstance(parallel_workers, int):
                 raise TypeError("parallel_workers must be a positive integer or None.")
@@ -682,6 +806,8 @@ class GeneticAlgorithm:
         self.current_generation.create_fitness_ranking()
         self.best_fit_history = [self.current_generation.fitness_ranking[0].get('fitness value')]
         self._retain_generation_snapshot(0)
+        if self.lineage_tracker is not None:
+            self.lineage_tracker.record_generation(self.current_generation, 0)
 
     @staticmethod
     def _create_members_for_rival_generation(
@@ -812,6 +938,20 @@ class GeneticAlgorithm:
         bf = (best_genome, best_fit_val)
         return bf
 
+    def best_solution_lineage(self) -> list[dict]:
+        """Return the final best member and its recorded ancestors in generation/ID order."""
+        if self.lineage_tracker is None:
+            raise RuntimeError("Enable lineage_tracking='parents' or 'full' before running the algorithm.")
+        best_index = self.current_generation.fitness_ranking[0].get('index')
+        best_member_id = self.current_generation.members[best_index].id
+        ancestor_ids = self.lineage_tracker.ancestors(best_member_id)
+        records = [self.lineage_tracker.get_record(member_id) for member_id in ancestor_ids]
+        records.sort(key=lambda record: (record["generation"], record["member_id"]))
+        if self.lineage_tracking == "full":
+            for record in records:
+                record["genome"] = self.lineage_tracker.get_genome(record["member_id"])
+        return records
+
     def _choose_best_rival_generation(self):
         """Select the rival generation with the highest best-member fitness."""
         fitness_comparison = {}
@@ -828,6 +968,8 @@ class GeneticAlgorithm:
         """Record compact fitness history and, when requested, a complete population snapshot."""
         self.best_fit_history.append(self.current_generation.fitness_ranking[0].get('fitness value'))
         self._retain_generation_snapshot(generation_number)
+        if self.lineage_tracker is not None:
+            self.lineage_tracker.record_generation(self.current_generation, generation_number)
 
     def mutate(self, mutation_type: str = "member") -> list[int]:  # TODO: add adaptive mutation
         """Mutate the current generation and return indexes whose fitness values became stale.
